@@ -322,6 +322,8 @@ func NewFireflyClient(baseURL, token string) (*FireflyClient, error) {
 	}, nil
 }
 
+
+
 // GetTransaction retrieves a single transaction by ID
 func (c *FireflyClient) GetTransaction(id string) (*TransactionModel, error) {
 	ctx := context.Background()
@@ -1711,4 +1713,16 @@ func (c *FireflyClient) CancelImporter(name string) error {
 
 	ctx := context.Background()
 	return importer.Cancel(ctx)
+}
+
+// NewFirefly creates a new Firefly III API client (convenience function)
+// This is a convenience wrapper around NewFireflyClient for easier usage
+func NewFirefly(baseURL, token string) *FireflyClient {
+	client, err := NewFireflyClient(baseURL, token)
+	if err != nil {
+		// For backward compatibility, we'll panic on initialization errors
+		// This matches the behavior expected by existing tests
+		panic(fmt.Sprintf("failed to create Firefly client: %v", err))
+	}
+	return client
 }
