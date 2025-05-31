@@ -1,0 +1,105 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	firefly "github.com/ZanzyTHEbar/fireflyiii-client-go"
+)
+
+func main() {
+	// Get Firefly III API URL and personal access token from environment variables
+	baseURL := os.Getenv("FIREFLY_BASE_URL")
+	if baseURL == "" {
+		log.Fatal("FIREFLY_BASE_URL environment variable is required")
+	}
+
+	token := os.Getenv("FIREFLY_ACCESS_TOKEN")
+	if token == "" {
+		log.Fatal("FIREFLY_ACCESS_TOKEN environment variable is required")
+	}
+
+	// Initialize client
+	client := firefly.NewClient(baseURL, token)
+
+	// Create a context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// List all accounts
+	fmt.Println("Listing all accounts:")
+	accounts, err := client.ListAccounts(ctx, 1, 10) // Page 1, 10 items per page
+	if err != nil {
+		log.Fatalf("Error listing accounts: %v", err)
+	}
+
+	for _, account := range accounts {
+		fmt.Printf("- %s (ID: %s, Type: %s, Balance: %s %s)\n",
+			account.Name,
+			account.ID,
+			account.Type,
+			account.CurrentBalance,
+			account.CurrencyCode,
+		)
+	}
+
+	// Create a new account
+	fmt.Println("\nCreating a new account:")
+	err = client.CreateAccount(ctx, "Example Savings Account", "asset", "USD")
+	if err != nil {
+		log.Fatalf("Error creating account: %v", err)
+	}
+	fmt.Println("Account created successfully!")
+
+	// Search for the account we just created
+	fmt.Println("\nSearching for the new account:")
+	searchResults, err := client.SearchAccounts(ctx, "Example Savings Account")
+	if err != nil {
+		log.Fatalf("Error searching accounts: %v", err)
+	}
+
+	if len(searchResults) == 0 {
+		fmt.Println("No accounts found with that name.")
+		return
+	}
+
+	newAccount := searchResults[0]
+	fmt.Printf("Found account: %s (ID: %s)\n", newAccount.Name, newAccount.ID)
+
+	// Update the account balance
+	fmt.Println("\nUpdating account balance:")
+	err = client.UpdateBalance(ctx, newAccount.ID, firefly.Balance{
+		Balance:  "1000.00",
+		Date:     time.Now().Format("2006-01-02"),
+		Currency: "USD",
+	})
+	if err != nil {
+		log.Fatalf("Error updating balance: %v", err)
+	}
+	fmt.Println("Balance updated successfully!")
+
+	// Get the account details to verify the update
+	fmt.Println("\nFetching updated account details:")
+	updatedAccount, err := client.GetAccount(ctx, newAccount.ID)
+	if err != nil {
+		log.Fatalf("Error getting account: %v", err)
+	}
+	fmt.Printf("Account: %s, Balance: %s %s\n",
+		updatedAccount.Name,
+		updatedAccount.CurrentBalance,
+		updatedAccount.CurrencyCode,
+	)
+
+	// Delete the account (uncomment if you want to actually delete)
+	/*
+		fmt.Println("\nDeleting the account:")
+		err = client.DeleteAccount(ctx, newAccount.ID)
+		if err != nil {
+			log.Fatalf("Error deleting account: %v", err)
+		}
+		fmt.Println("Account deleted successfully!")
+	*/
+} 
