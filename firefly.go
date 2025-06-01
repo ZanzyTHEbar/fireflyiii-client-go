@@ -180,11 +180,11 @@ type FireflyClientInterface interface {
 
 // FireflyClient represents a client for the Firefly III API
 type FireflyClient struct {
-	baseURL    string
-	token      string
-	client     *http.Client
-	clientAPI  *ClientWithResponses
-	importers  map[string]importers.Importer
+	baseURL   string
+	token     string
+	client    *http.Client
+	clientAPI *ClientWithResponses
+	importers map[string]importers.Importer
 }
 
 // TransactionModel represents a financial transaction in our domain model
@@ -321,8 +321,6 @@ func NewFireflyClient(baseURL, token string) (*FireflyClient, error) {
 		importers: make(map[string]importers.Importer),
 	}, nil
 }
-
-
 
 // GetTransaction retrieves a single transaction by ID
 func (c *FireflyClient) GetTransaction(id string) (*TransactionModel, error) {
