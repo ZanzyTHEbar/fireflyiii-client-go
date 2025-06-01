@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	mathrand "math/rand"
 	"net/http"
@@ -479,11 +480,14 @@ func (ws *WebhookServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := json.RawMessage{}, error(nil)
+	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return
 	}
+	defer r.Body.Close()
+
+	body := json.RawMessage(bodyBytes)
 
 	// TODO: Implement webhook signature verification if secret is provided
 	if ws.secret != "" {
@@ -511,10 +515,6 @@ type FireflyClient struct {
 	config     *ClientConfig // Store configuration for advanced client
 	middleware *MiddlewareChain
 	webhookMgr *WebhookManager
-
-	// Rate limiter for API requests
-	limiter   *rate.Limiter
-	limiterMu sync.Mutex // Mutex to protect access to limiter
 }
 
 // TransactionModel represents a financial transaction in our domain model
@@ -711,7 +711,6 @@ func NewFireflyClient(baseURL, token string) (*FireflyClient, error) {
 		importers:  make(map[string]importers.Importer),
 		middleware: NewMiddlewareChain(),
 		webhookMgr: NewWebhookManager(),
-		limiter:    rate.NewLimiter(rate.Limit(60), 1), // 60 requests per minute
 	}, nil
 }
 
@@ -850,9 +849,7 @@ func (c *FireflyClient) GetTransaction(ctx context.Context, id string) (*Transac
 }
 
 // ListTransactions retrieves a list of transactions with pagination
-func (c *FireflyClient) ListTransactions(page, limit int) ([]TransactionModel, error) {
-	ctx := context.Background()
-
+func (c *FireflyClient) ListTransactions(ctx context.Context, page, limit int) ([]TransactionModel, error) {
 	// Call the API
 	resp, err := c.clientAPI.ListTransactionWithResponse(ctx, &ListTransactionParams{
 		Page:  int32Ptr(page),
@@ -926,13 +923,12 @@ func (c *FireflyClient) ListTransactions(page, limit int) ([]TransactionModel, e
 }
 
 // UpdateTransaction updates an existing transaction
-func (c *FireflyClient) UpdateTransaction(id string, tx TransactionModel) error {
+func (c *FireflyClient) UpdateTransaction(ctx context.Context, id string, tx TransactionModel) error {
 	// Validate transaction
 	if errs := validateTransaction(tx); errs != nil {
 		return TransactionValidationErr(errs)
 	}
 
-	ctx := context.Background()
 	txType := TransactionTypeProperty(tx.TransType)
 
 	// Convert our transaction to the API format
@@ -975,9 +971,7 @@ func (c *FireflyClient) UpdateTransaction(id string, tx TransactionModel) error 
 }
 
 // DeleteTransaction deletes a transaction by ID
-func (c *FireflyClient) DeleteTransaction(id string) error {
-	ctx := context.Background()
-
+func (c *FireflyClient) DeleteTransaction(ctx context.Context, id string) error {
 	// Call the API
 	resp, err := c.clientAPI.DeleteTransactionWithResponse(ctx, id, &DeleteTransactionParams{})
 	if err != nil {
@@ -999,9 +993,7 @@ func (c *FireflyClient) DeleteTransaction(id string) error {
 }
 
 // SearchTransactions searches for transactions matching the query
-func (c *FireflyClient) SearchTransactions(query string) ([]TransactionModel, error) {
-	ctx := context.Background()
-
+func (c *FireflyClient) SearchTransactions(ctx context.Context, query string) ([]TransactionModel, error) {
 	// Call the API
 	resp, err := c.clientAPI.SearchTransactionsWithResponse(ctx, &SearchTransactionsParams{
 		Query: query,
@@ -1074,13 +1066,12 @@ func (c *FireflyClient) SearchTransactions(query string) ([]TransactionModel, er
 }
 
 // ImportTransaction imports a single transaction
-func (c *FireflyClient) ImportTransaction(tx TransactionModel) error {
+func (c *FireflyClient) ImportTransaction(ctx context.Context, tx TransactionModel) error {
 	// Validate transaction
 	if errs := validateTransaction(tx); errs != nil {
 		return TransactionValidationErr(errs)
 	}
 
-	ctx := context.Background()
 	txType := TransactionTypeProperty(tx.TransType)
 
 	// Convert our transaction to the API format
@@ -1126,9 +1117,7 @@ func (c *FireflyClient) ImportTransaction(tx TransactionModel) error {
 }
 
 // ImportTransactions imports multiple transactions in batch
-func (c *FireflyClient) ImportTransactions(transactions []TransactionModel) error {
-	ctx := context.Background()
-
+func (c *FireflyClient) ImportTransactions(ctx context.Context, transactions []TransactionModel) error {
 	// Validate all transactions first
 	for _, tx := range transactions {
 		if errs := validateTransaction(tx); errs != nil {
@@ -1184,7 +1173,7 @@ func (c *FireflyClient) ImportTransactions(transactions []TransactionModel) erro
 }
 
 // CreateAccount creates a new account
-func (c *FireflyClient) CreateAccount(name, accountType, currency string) error {
+func (c *FireflyClient) CreateAccount(ctx context.Context, name, accountType, currency string) error {
 	// Validate account
 	account := AccountModel{
 		Name:     name,
@@ -1194,8 +1183,6 @@ func (c *FireflyClient) CreateAccount(name, accountType, currency string) error 
 	if errs := validateAccount(account); errs != nil {
 		return AccountValidationErr(errs)
 	}
-
-	ctx := context.Background()
 
 	// Create account request
 	accountRequest := StoreAccountJSONRequestBody{
@@ -1225,9 +1212,7 @@ func (c *FireflyClient) CreateAccount(name, accountType, currency string) error 
 }
 
 // UpdateBalance updates an account's balance
-func (c *FireflyClient) UpdateBalance(accountID string, balance Balance) error {
-	ctx := context.Background()
-
+func (c *FireflyClient) UpdateBalance(ctx context.Context, accountID string, balance Balance) error {
 	// Convert float64 to string for API
 	balanceStr := fmt.Sprintf("%.2f", balance.Amount)
 
@@ -1258,9 +1243,7 @@ func (c *FireflyClient) UpdateBalance(accountID string, balance Balance) error {
 }
 
 // GetAccount retrieves a single account by ID
-func (c *FireflyClient) GetAccount(id string) (*AccountModel, error) {
-	ctx := context.Background()
-
+func (c *FireflyClient) GetAccount(ctx context.Context, id string) (*AccountModel, error) {
 	// Call the API
 	resp, err := c.clientAPI.GetAccountWithResponse(ctx, id, &GetAccountParams{})
 	if err != nil {
@@ -1322,9 +1305,7 @@ func (c *FireflyClient) GetAccount(id string) (*AccountModel, error) {
 }
 
 // ListAccounts retrieves a list of accounts with pagination
-func (c *FireflyClient) ListAccounts(page, limit int) ([]AccountModel, error) {
-	ctx := context.Background()
-
+func (c *FireflyClient) ListAccounts(ctx context.Context, page, limit int) ([]AccountModel, error) {
 	// Call the API
 	resp, err := c.clientAPI.ListAccountWithResponse(ctx, &ListAccountParams{
 		Page:  int32Ptr(page),
@@ -1390,9 +1371,7 @@ func (c *FireflyClient) ListAccounts(page, limit int) ([]AccountModel, error) {
 }
 
 // DeleteAccount deletes an account by ID
-func (c *FireflyClient) DeleteAccount(id string) error {
-	ctx := context.Background()
-
+func (c *FireflyClient) DeleteAccount(ctx context.Context, id string) error {
 	// Call the API
 	resp, err := c.clientAPI.DeleteAccountWithResponse(ctx, id, &DeleteAccountParams{})
 	if err != nil {
@@ -1408,9 +1387,7 @@ func (c *FireflyClient) DeleteAccount(id string) error {
 }
 
 // SearchAccounts searches for accounts matching the query
-func (c *FireflyClient) SearchAccounts(query string) ([]AccountModel, error) {
-	ctx := context.Background()
-
+func (c *FireflyClient) SearchAccounts(ctx context.Context, query string) ([]AccountModel, error) {
 	// Call the API
 	resp, err := c.clientAPI.SearchAccountsWithResponse(ctx, &SearchAccountsParams{
 		Query: query,
@@ -1476,13 +1453,11 @@ func (c *FireflyClient) SearchAccounts(query string) ([]AccountModel, error) {
 }
 
 // CreateCategory creates a new category
-func (c *FireflyClient) CreateCategory(category CategoryModel) error {
+func (c *FireflyClient) CreateCategory(ctx context.Context, category CategoryModel) error {
 	// Validate category
 	if errs := validateCategory(category); errs != nil {
 		return CategoryValidationErr(errs)
 	}
-
-	ctx := context.Background()
 
 	notes := category.Notes // Create a copy to get address of
 	// Create category request
@@ -1512,8 +1487,7 @@ func (c *FireflyClient) CreateCategory(category CategoryModel) error {
 }
 
 // GetCategory retrieves a single category by ID
-func (c *FireflyClient) GetCategory(id string) (*CategoryModel, error) {
-	ctx := context.Background()
+func (c *FireflyClient) GetCategory(ctx context.Context, id string) (*CategoryModel, error) {
 	response, err := c.clientAPI.GetCategoryWithResponse(ctx, id, &GetCategoryParams{})
 	if err != nil {
 		return nil, APIErr("Failed to get category", err)
@@ -1576,9 +1550,7 @@ func (c *FireflyClient) GetCategory(id string) (*CategoryModel, error) {
 }
 
 // ListCategories retrieves a list of categories with pagination
-func (c *FireflyClient) ListCategories(page, limit int) ([]CategoryModel, error) {
-	ctx := context.Background()
-
+func (c *FireflyClient) ListCategories(ctx context.Context, page, limit int) ([]CategoryModel, error) {
 	// Convert page and limit to int32
 	page32 := int32(page)
 	limit32 := int32(limit)
@@ -1631,13 +1603,11 @@ func (c *FireflyClient) ListCategories(page, limit int) ([]CategoryModel, error)
 }
 
 // UpdateCategory updates an existing category
-func (c *FireflyClient) UpdateCategory(id string, category CategoryModel) error {
+func (c *FireflyClient) UpdateCategory(ctx context.Context, id string, category CategoryModel) error {
 	// Validate category
 	if errs := validateCategory(category); errs != nil {
 		return CategoryValidationErr(errs)
 	}
-
-	ctx := context.Background()
 
 	notes := category.Notes // Create a copy to get address of
 	update := UpdateCategoryJSONRequestBody{
@@ -1669,9 +1639,7 @@ func (c *FireflyClient) UpdateCategory(id string, category CategoryModel) error 
 }
 
 // DeleteCategory deletes a category
-func (c *FireflyClient) DeleteCategory(id string) error {
-	ctx := context.Background()
-
+func (c *FireflyClient) DeleteCategory(ctx context.Context, id string) error {
 	// Call the API
 	resp, err := c.clientAPI.DeleteCategoryWithResponse(ctx, id, &DeleteCategoryParams{})
 	if err != nil {
@@ -1693,9 +1661,9 @@ func (c *FireflyClient) DeleteCategory(id string) error {
 }
 
 // SearchCategories searches for categories matching the query
-func (c *FireflyClient) SearchCategories(query string) ([]CategoryModel, error) {
+func (c *FireflyClient) SearchCategories(ctx context.Context, query string) ([]CategoryModel, error) {
 	// Get all categories (with a reasonable limit)
-	categories, err := c.ListCategories(1, 100)
+	categories, err := c.ListCategories(ctx, 1, 100)
 	if err != nil {
 		return nil, APIErr("Failed to search categories", err)
 	}
@@ -1714,9 +1682,9 @@ func (c *FireflyClient) SearchCategories(query string) ([]CategoryModel, error) 
 }
 
 // GetCategoryByName retrieves a category by its exact name (case-insensitive)
-func (c *FireflyClient) GetCategoryByName(name string) (*CategoryModel, error) {
+func (c *FireflyClient) GetCategoryByName(ctx context.Context, name string) (*CategoryModel, error) {
 	// Get all categories (with a reasonable limit)
-	categories, err := c.ListCategories(1, 100)
+	categories, err := c.ListCategories(ctx, 1, 100)
 	if err != nil {
 		return nil, APIErr("Failed to get category by name", err)
 	}
