@@ -775,7 +775,6 @@ func NewFireflyClientWithConfig(config *ClientConfig) (*FireflyClient, error) {
 		config:     config, // Store configuration for later use
 		middleware: NewMiddlewareChain(),
 		webhookMgr: NewWebhookManager(),
-		limiter:    rate.NewLimiter(rate.Limit(config.RateLimit), 1), // requests per minute
 	}, nil
 }
 
@@ -2472,10 +2471,13 @@ func (c *FireflyClient) GetWebhookManager() *WebhookManager {
 
 // EnableDefaultMiddleware enables commonly used middleware with default configurations
 func (c *FireflyClient) EnableDefaultMiddleware() {
-	// Add rate limiting middleware
-	if c.limiter != nil {
-		c.AddMiddleware(NewRateLimitMiddleware(c.limiter))
+	// Add rate limiting middleware with default or configured rate
+	rateLimit := 60.0 // default 60 requests per minute
+	if c.config != nil && c.config.RateLimit > 0 {
+		rateLimit = float64(c.config.RateLimit)
 	}
+	limiter := rate.NewLimiter(rate.Limit(rateLimit), 1)
+	c.AddMiddleware(NewRateLimitMiddleware(limiter))
 
 	// Add logging middleware if debug mode is enabled
 	if c.config != nil && c.config.DebugMode {
