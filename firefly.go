@@ -2,12 +2,21 @@ package firefly
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
+	mathrand "math/rand"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/clientcredentials"
+	"golang.org/x/time/rate"
 
 	"github.com/ZanzyTHEbar/fireflyiii-client-go/importers"
 )
@@ -178,13 +187,334 @@ type FireflyClientInterface interface {
 	CancelImporter(name string) error
 }
 
+// Middleware defines the interface for request/response middleware
+type Middleware interface {
+	ProcessRequest(ctx context.Context, req *http.Request) (*http.Request, error)
+	ProcessResponse(ctx context.Context, resp *http.Response) (*http.Response, error)
+}
+
+// MiddlewareFunc allows using functions as middleware
+type MiddlewareFunc func(ctx context.Context, req *http.Request, next func(*http.Request) (*http.Response, error)) (*http.Response, error)
+
+// LoggingMiddleware logs HTTP requests and responses
+type LoggingMiddleware struct {
+	logger func(format string, args ...interface{})
+}
+
+// NewLoggingMiddleware creates a new logging middleware
+func NewLoggingMiddleware(logger func(format string, args ...interface{})) *LoggingMiddleware {
+	if logger == nil {
+		logger = func(format string, args ...interface{}) {
+			// Default no-op logger
+		}
+	}
+	return &LoggingMiddleware{logger: logger}
+}
+
+// ProcessRequest logs the outgoing request
+func (l *LoggingMiddleware) ProcessRequest(ctx context.Context, req *http.Request) (*http.Request, error) {
+	l.logger("HTTP Request: %s %s", req.Method, req.URL.String())
+	return req, nil
+}
+
+// ProcessResponse logs the incoming response
+func (l *LoggingMiddleware) ProcessResponse(ctx context.Context, resp *http.Response) (*http.Response, error) {
+	l.logger("HTTP Response: %d %s", resp.StatusCode, resp.Status)
+	return resp, nil
+}
+
+// RetryMiddleware implements retry logic as middleware
+type RetryMiddleware struct {
+	config *RetryConfig
+}
+
+// NewRetryMiddleware creates a new retry middleware
+func NewRetryMiddleware(config *RetryConfig) *RetryMiddleware {
+	if config == nil {
+		config = DefaultRetryConfig()
+	}
+	return &RetryMiddleware{config: config}
+}
+
+// ProcessRequest passes through the request
+func (r *RetryMiddleware) ProcessRequest(ctx context.Context, req *http.Request) (*http.Request, error) {
+	return req, nil
+}
+
+// ProcessResponse handles retry logic based on response
+func (r *RetryMiddleware) ProcessResponse(ctx context.Context, resp *http.Response) (*http.Response, error) {
+	// Create an HTTPError from the response for retry decision
+	if resp.StatusCode >= 400 {
+		httpErr := &HTTPError{
+			StatusCode: resp.StatusCode,
+			Method:     resp.Request.Method,
+			URL:        resp.Request.URL.String(),
+			Timestamp:  time.Now(),
+		}
+
+		// If this is a retryable error, return the error to trigger retry
+		if r.config.isRetryableError(httpErr) {
+			return nil, httpErr
+		}
+	}
+
+	return resp, nil
+}
+
+// RateLimitMiddleware implements rate limiting as middleware
+type RateLimitMiddleware struct {
+	limiter *rate.Limiter
+}
+
+// NewRateLimitMiddleware creates a new rate limiting middleware
+func NewRateLimitMiddleware(limiter *rate.Limiter) *RateLimitMiddleware {
+	return &RateLimitMiddleware{limiter: limiter}
+}
+
+// ProcessRequest applies rate limiting before the request
+func (r *RateLimitMiddleware) ProcessRequest(ctx context.Context, req *http.Request) (*http.Request, error) {
+	if err := r.limiter.Wait(ctx); err != nil {
+		return nil, fmt.Errorf("rate limit wait failed: %w", err)
+	}
+	return req, nil
+}
+
+// ProcessResponse passes through the response
+func (r *RateLimitMiddleware) ProcessResponse(ctx context.Context, resp *http.Response) (*http.Response, error) {
+	return resp, nil
+}
+
+// MiddlewareChain manages a chain of middleware
+type MiddlewareChain struct {
+	middlewares []Middleware
+	mu          sync.RWMutex
+}
+
+// NewMiddlewareChain creates a new middleware chain
+func NewMiddlewareChain() *MiddlewareChain {
+	return &MiddlewareChain{
+		middlewares: make([]Middleware, 0),
+	}
+}
+
+// Add adds middleware to the chain
+func (m *MiddlewareChain) Add(middleware Middleware) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.middlewares = append(m.middlewares, middleware)
+}
+
+// ProcessRequest processes the request through all middleware
+func (m *MiddlewareChain) ProcessRequest(ctx context.Context, req *http.Request) (*http.Request, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	currentReq := req
+	for _, middleware := range m.middlewares {
+		var err error
+		currentReq, err = middleware.ProcessRequest(ctx, currentReq)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return currentReq, nil
+}
+
+// ProcessResponse processes the response through all middleware (in reverse order)
+func (m *MiddlewareChain) ProcessResponse(ctx context.Context, resp *http.Response) (*http.Response, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	currentResp := resp
+	// Process in reverse order
+	for i := len(m.middlewares) - 1; i >= 0; i-- {
+		var err error
+		currentResp, err = m.middlewares[i].ProcessResponse(ctx, currentResp)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return currentResp, nil
+}
+
+// WebhookEvent represents a webhook event from Firefly III
+type WebhookEvent struct {
+	ID        string                 `json:"id"`
+	Type      string                 `json:"type"`
+	Timestamp time.Time              `json:"timestamp"`
+	Data      map[string]interface{} `json:"data"`
+	Metadata  map[string]interface{} `json:"metadata,omitempty"`
+}
+
+// WebhookHandler defines the interface for handling webhook events
+type WebhookHandler interface {
+	HandleEvent(ctx context.Context, event *WebhookEvent) error
+}
+
+// WebhookHandlerFunc allows using functions as webhook handlers
+type WebhookHandlerFunc func(ctx context.Context, event *WebhookEvent) error
+
+// HandleEvent implements WebhookHandler for WebhookHandlerFunc
+func (f WebhookHandlerFunc) HandleEvent(ctx context.Context, event *WebhookEvent) error {
+	return f(ctx, event)
+}
+
+// WebhookManager manages webhook handlers and routing
+type WebhookManager struct {
+	handlers map[string][]WebhookHandler
+	mu       sync.RWMutex
+}
+
+// NewWebhookManager creates a new webhook manager
+func NewWebhookManager() *WebhookManager {
+	return &WebhookManager{
+		handlers: make(map[string][]WebhookHandler),
+	}
+}
+
+// RegisterHandler registers a handler for a specific event type
+func (w *WebhookManager) RegisterHandler(eventType string, handler WebhookHandler) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.handlers[eventType] = append(w.handlers[eventType], handler)
+}
+
+// RegisterHandlerFunc registers a handler function for a specific event type
+func (w *WebhookManager) RegisterHandlerFunc(eventType string, handlerFunc func(ctx context.Context, event *WebhookEvent) error) {
+	w.RegisterHandler(eventType, WebhookHandlerFunc(handlerFunc))
+}
+
+// ProcessWebhook processes an incoming webhook payload
+func (w *WebhookManager) ProcessWebhook(ctx context.Context, payload []byte) error {
+	var event WebhookEvent
+	if err := json.Unmarshal(payload, &event); err != nil {
+		return fmt.Errorf("failed to unmarshal webhook payload: %w", err)
+	}
+
+	w.mu.RLock()
+	handlers, exists := w.handlers[event.Type]
+	w.mu.RUnlock()
+
+	if !exists {
+		// No handlers registered for this event type, not an error
+		return nil
+	}
+
+	// Process handlers concurrently
+	errChan := make(chan error, len(handlers))
+	for _, handler := range handlers {
+		go func(h WebhookHandler) {
+			errChan <- h.HandleEvent(ctx, &event)
+		}(handler)
+	}
+
+	// Collect errors
+	var errs []error
+	for i := 0; i < len(handlers); i++ {
+		if err := <-errChan; err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("webhook processing errors: %v", errs)
+	}
+
+	return nil
+}
+
+// WebhookServer provides an HTTP server for receiving webhooks
+type WebhookServer struct {
+	manager *WebhookManager
+	server  *http.Server
+	secret  string
+	path    string
+}
+
+// NewWebhookServer creates a new webhook server
+func NewWebhookServer(addr, path, secret string, manager *WebhookManager) *WebhookServer {
+	if manager == nil {
+		manager = NewWebhookManager()
+	}
+
+	return &WebhookServer{
+		manager: manager,
+		secret:  secret,
+		path:    path,
+		server: &http.Server{
+			Addr:         addr,
+			ReadTimeout:  10 * time.Second,
+			WriteTimeout: 10 * time.Second,
+		},
+	}
+}
+
+// Start starts the webhook server
+func (ws *WebhookServer) Start(ctx context.Context) error {
+	mux := http.NewServeMux()
+	mux.HandleFunc(ws.path, ws.handleWebhook)
+	ws.server.Handler = mux
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ws.server.Shutdown(shutdownCtx)
+	}()
+
+	if err := ws.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return fmt.Errorf("webhook server error: %w", err)
+	}
+
+	return nil
+}
+
+// handleWebhook handles incoming webhook requests
+func (ws *WebhookServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := json.RawMessage{}, error(nil)
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	// TODO: Implement webhook signature verification if secret is provided
+	if ws.secret != "" {
+		// Verify webhook signature here
+		// This would typically involve checking HMAC signature in headers
+	}
+
+	ctx := r.Context()
+	if err := ws.manager.ProcessWebhook(ctx, body); err != nil {
+		http.Error(w, "Failed to process webhook", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
 // FireflyClient represents a client for the Firefly III API
 type FireflyClient struct {
-	baseURL   string
-	token     string
-	client    *http.Client
-	clientAPI *ClientWithResponses
-	importers map[string]importers.Importer
+	baseURL    string
+	token      string
+	client     *http.Client
+	clientAPI  *ClientWithResponses
+	importers  map[string]importers.Importer
+	config     *ClientConfig // Store configuration for advanced client
+	middleware *MiddlewareChain
+	webhookMgr *WebhookManager
+
+	// Rate limiter for API requests
+	limiter   *rate.Limiter
+	limiterMu sync.Mutex // Mutex to protect access to limiter
 }
 
 // TransactionModel represents a financial transaction in our domain model
@@ -231,11 +561,11 @@ type CategoryEarnedModel struct {
 
 // CategoryModel represents a category in Firefly III
 type CategoryModel struct {
-	ID                  string
-	Name                string
-	Notes               string
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	ID                  string                // The category ID
+	Name                string                // The category name
+	Notes               string                // Additional notes about the category
+	CreatedAt           time.Time             // When the category was created
+	UpdatedAt           time.Time             // When the category was last updated
 	Spent               []CategorySpentModel  // Total amount spent in this category
 	Earned              []CategoryEarnedModel // Total amount earned in this category
 	NativeCurrency      string                // The administration's native currency code
@@ -299,6 +629,66 @@ type BudgetLimitModel struct {
 	UpdatedAt time.Time
 }
 
+// TODO: Add OAuth2 authentication configuration
+type OAuth2Config struct {
+	ClientID     string   `yaml:"client_id" json:"client_id"`
+	ClientSecret string   `yaml:"client_secret" json:"client_secret"`
+	Scopes       []string `yaml:"scopes" json:"scopes"`
+	RedirectURL  string   `yaml:"redirect_url" json:"redirect_url"`
+	AuthURL      string   `yaml:"auth_url" json:"auth_url"`
+	TokenURL     string   `yaml:"token_url" json:"token_url"`
+}
+
+// ClientConfig holds configuration for the Firefly client
+type ClientConfig struct {
+	BaseURL    string        `yaml:"base_url" json:"base_url"`
+	Token      string        `yaml:"token" json:"token"`
+	Timeout    time.Duration `yaml:"timeout" json:"timeout"`
+	RetryCount int           `yaml:"retry_count" json:"retry_count"`
+	RetryDelay time.Duration `yaml:"retry_delay" json:"retry_delay"`
+	RateLimit  int           `yaml:"rate_limit" json:"rate_limit"`
+	OAuth2     *OAuth2Config `yaml:"oauth2,omitempty" json:"oauth2,omitempty"`
+	UserAgent  string        `yaml:"user_agent" json:"user_agent"`
+	DebugMode  bool          `yaml:"debug_mode" json:"debug_mode"`
+}
+
+// DefaultClientConfig returns a default client configuration
+func DefaultClientConfig() *ClientConfig {
+	return &ClientConfig{
+		Timeout:    30 * time.Second,
+		RetryCount: 3,
+		RetryDelay: time.Second,
+		RateLimit:  60, // requests per minute
+		UserAgent:  "firefly-client-go/1.0.0",
+		DebugMode:  false,
+	}
+}
+
+// WithOAuth2 configures OAuth2 authentication
+func (c *ClientConfig) WithOAuth2(oauth2 OAuth2Config) *ClientConfig {
+	c.OAuth2 = &oauth2
+	return c
+}
+
+// WithTimeout sets the request timeout
+func (c *ClientConfig) WithTimeout(timeout time.Duration) *ClientConfig {
+	c.Timeout = timeout
+	return c
+}
+
+// WithRetry configures retry behavior
+func (c *ClientConfig) WithRetry(count int, delay time.Duration) *ClientConfig {
+	c.RetryCount = count
+	c.RetryDelay = delay
+	return c
+}
+
+// WithRateLimit sets the rate limit (requests per minute)
+func (c *ClientConfig) WithRateLimit(limit int) *ClientConfig {
+	c.RateLimit = limit
+	return c
+}
+
 // NewFireflyClient creates a new Firefly III API client
 func NewFireflyClient(baseURL, token string) (*FireflyClient, error) {
 	// Create HTTP client with auth header
@@ -314,18 +704,84 @@ func NewFireflyClient(baseURL, token string) (*FireflyClient, error) {
 	}
 
 	return &FireflyClient{
-		baseURL:   baseURL,
-		token:     token,
-		client:    client,
-		clientAPI: clientAPI,
-		importers: make(map[string]importers.Importer),
+		baseURL:    baseURL,
+		token:      token,
+		client:     client,
+		clientAPI:  clientAPI,
+		importers:  make(map[string]importers.Importer),
+		middleware: NewMiddlewareChain(),
+		webhookMgr: NewWebhookManager(),
+		limiter:    rate.NewLimiter(rate.Limit(60), 1), // 60 requests per minute
+	}, nil
+}
+
+// NewFireflyClientWithConfig creates a new Firefly III API client with advanced configuration
+func NewFireflyClientWithConfig(config *ClientConfig) (*FireflyClient, error) {
+	if config == nil {
+		return nil, fmt.Errorf("client configuration cannot be nil")
+	}
+
+	if config.BaseURL == "" {
+		return nil, fmt.Errorf("base URL is required")
+	}
+
+	// Create HTTP client with timeout and transport configuration
+	client := &http.Client{
+		Timeout: config.Timeout,
+		Transport: &http.Transport{
+			MaxIdleConns:       10,
+			IdleConnTimeout:    30 * time.Second,
+			DisableCompression: false,
+		},
+	}
+
+	// Create request editor function for authentication and headers
+	requestEditor := func(ctx context.Context, req *http.Request) error {
+		// Add authentication
+		if config.OAuth2 != nil {
+			// TODO: Implement OAuth2 token refresh logic here
+			// For now, fall back to token if available
+			if config.Token != "" {
+				req.Header.Set("Authorization", "Bearer "+config.Token)
+			}
+		} else if config.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+config.Token)
+		}
+
+		// Add user agent
+		if config.UserAgent != "" {
+			req.Header.Set("User-Agent", config.UserAgent)
+		}
+
+		// Add debug headers if enabled
+		if config.DebugMode {
+			req.Header.Set("X-Debug", "true")
+		}
+
+		return nil
+	}
+
+	// Create the generated client with responses and auth
+	clientAPI, err := NewClientWithResponses(config.BaseURL, WithHTTPClient(client), WithRequestEditorFn(requestEditor))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Firefly III client: %w", err)
+	}
+
+	return &FireflyClient{
+		baseURL:    config.BaseURL,
+		token:      config.Token,
+		client:     client,
+		clientAPI:  clientAPI,
+		importers:  make(map[string]importers.Importer),
+		config:     config, // Store configuration for later use
+		middleware: NewMiddlewareChain(),
+		webhookMgr: NewWebhookManager(),
+		limiter:    rate.NewLimiter(rate.Limit(config.RateLimit), 1), // requests per minute
 	}, nil
 }
 
 // GetTransaction retrieves a single transaction by ID
-func (c *FireflyClient) GetTransaction(id string) (*TransactionModel, error) {
-	ctx := context.Background()
-
+func (c *FireflyClient) GetTransaction(ctx context.Context, id string) (*TransactionModel, error) {
 	// Call the API
 	resp, err := c.clientAPI.GetTransactionWithResponse(ctx, id, &GetTransactionParams{})
 	if err != nil {
@@ -1723,4 +2179,358 @@ func NewFirefly(baseURL, token string) *FireflyClient {
 		panic(fmt.Sprintf("failed to create Firefly client: %v", err))
 	}
 	return client
+}
+
+// OAuth2TokenResponse represents the response from OAuth2 token endpoint
+type OAuth2TokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int    `json:"expires_in"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	Scope        string `json:"scope,omitempty"`
+}
+
+// GetOAuth2ClientCredentialsToken obtains an access token using OAuth2 client credentials flow
+func (c *FireflyClient) GetOAuth2ClientCredentialsToken(ctx context.Context) (*OAuth2TokenResponse, error) {
+	if c.config == nil || c.config.OAuth2 == nil {
+		return nil, OAuth2Err(&OAuth2Error{
+			ErrorCode:        "oauth2_not_configured",
+			ErrorDescription: "OAuth2 configuration is missing",
+		})
+	}
+
+	oauth2Config := c.config.OAuth2
+	if oauth2Config.ClientID == "" || oauth2Config.ClientSecret == "" || oauth2Config.TokenURL == "" {
+		return nil, OAuth2Err(&OAuth2Error{
+			ErrorCode:        "oauth2_configuration_incomplete",
+			ErrorDescription: "client_id, client_secret, and token_url are required",
+		})
+	}
+
+	// Use golang.org/x/oauth2/clientcredentials for client credentials flow
+	config := &clientcredentials.Config{
+		ClientID:     oauth2Config.ClientID,
+		ClientSecret: oauth2Config.ClientSecret,
+		TokenURL:     oauth2Config.TokenURL,
+		Scopes:       oauth2Config.Scopes,
+	}
+
+	token, err := config.Token(ctx)
+	if err != nil {
+		return nil, OAuth2Err(&OAuth2Error{
+			ErrorCode:        "token_request_failed",
+			ErrorDescription: "Failed to obtain OAuth2 token: " + err.Error(),
+		})
+	}
+
+	return &OAuth2TokenResponse{
+		AccessToken: token.AccessToken,
+		TokenType:   token.TokenType,
+		ExpiresIn:   int(time.Until(token.Expiry).Seconds()),
+	}, nil
+}
+
+// GenerateOAuth2AuthURL generates an authorization URL for OAuth2 authorization code flow
+func (c *FireflyClient) GenerateOAuth2AuthURL(state string) (string, error) {
+	if c.config == nil || c.config.OAuth2 == nil {
+		return "", OAuth2Err(&OAuth2Error{
+			ErrorCode:        "oauth2_not_configured",
+			ErrorDescription: "OAuth2 configuration is missing",
+		})
+	}
+
+	oauth2Config := c.config.OAuth2
+	if oauth2Config.ClientID == "" || oauth2Config.AuthURL == "" || oauth2Config.RedirectURL == "" {
+		return "", OAuth2Err(&OAuth2Error{
+			ErrorCode:        "oauth2_configuration_incomplete",
+			ErrorDescription: "client_id, auth_url, and redirect_url are required",
+		})
+	}
+
+	config := &oauth2.Config{
+		ClientID:     oauth2Config.ClientID,
+		ClientSecret: oauth2Config.ClientSecret,
+		RedirectURL:  oauth2Config.RedirectURL,
+		Scopes:       oauth2Config.Scopes,
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  oauth2Config.AuthURL,
+			TokenURL: oauth2Config.TokenURL,
+		},
+	}
+
+	// Generate a random state if not provided
+	if state == "" {
+		bytes := make([]byte, 32)
+		if _, err := rand.Read(bytes); err != nil {
+			return "", OAuth2Err(&OAuth2Error{
+				ErrorCode:        "state_generation_failed",
+				ErrorDescription: "Failed to generate state: " + err.Error(),
+			})
+		}
+		state = base64.URLEncoding.EncodeToString(bytes)
+	}
+
+	return config.AuthCodeURL(state, oauth2.AccessTypeOffline), nil
+}
+
+// ExchangeOAuth2Code exchanges an authorization code for access token
+func (c *FireflyClient) ExchangeOAuth2Code(ctx context.Context, code, state string) (*OAuth2TokenResponse, error) {
+	if c.config == nil || c.config.OAuth2 == nil {
+		return nil, OAuth2Err(&OAuth2Error{
+			ErrorCode:        "oauth2_not_configured",
+			ErrorDescription: "OAuth2 configuration is missing",
+		})
+	}
+
+	oauth2Config := c.config.OAuth2
+	config := &oauth2.Config{
+		ClientID:     oauth2Config.ClientID,
+		ClientSecret: oauth2Config.ClientSecret,
+		RedirectURL:  oauth2Config.RedirectURL,
+		Scopes:       oauth2Config.Scopes,
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  oauth2Config.AuthURL,
+			TokenURL: oauth2Config.TokenURL,
+		},
+	}
+
+	token, err := config.Exchange(ctx, code)
+	if err != nil {
+		return nil, OAuth2Err(&OAuth2Error{
+			ErrorCode:        "code_exchange_failed",
+			ErrorDescription: "Failed to exchange OAuth2 code: " + err.Error(),
+		})
+	}
+
+	response := &OAuth2TokenResponse{
+		AccessToken: token.AccessToken,
+		TokenType:   token.TokenType,
+		ExpiresIn:   int(time.Until(token.Expiry).Seconds()),
+	}
+
+	if token.RefreshToken != "" {
+		response.RefreshToken = token.RefreshToken
+	}
+
+	return response, nil
+}
+
+// RefreshOAuth2Token refreshes an OAuth2 access token using refresh token
+func (c *FireflyClient) RefreshOAuth2Token(ctx context.Context, refreshToken string) (*OAuth2TokenResponse, error) {
+	if c.config == nil || c.config.OAuth2 == nil {
+		return nil, OAuth2Err(&OAuth2Error{
+			ErrorCode:        "oauth2_not_configured",
+			ErrorDescription: "OAuth2 configuration is missing",
+		})
+	}
+
+	oauth2Config := c.config.OAuth2
+	config := &oauth2.Config{
+		ClientID:     oauth2Config.ClientID,
+		ClientSecret: oauth2Config.ClientSecret,
+		RedirectURL:  oauth2Config.RedirectURL,
+		Scopes:       oauth2Config.Scopes,
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  oauth2Config.AuthURL,
+			TokenURL: oauth2Config.TokenURL,
+		},
+	}
+
+	token := &oauth2.Token{
+		RefreshToken: refreshToken,
+	}
+
+	tokenSource := config.TokenSource(ctx, token)
+	newToken, err := tokenSource.Token()
+	if err != nil {
+		return nil, OAuth2Err(&OAuth2Error{
+			ErrorCode:        "token_refresh_failed",
+			ErrorDescription: "Failed to refresh OAuth2 token: " + err.Error(),
+		})
+	}
+
+	response := &OAuth2TokenResponse{
+		AccessToken: newToken.AccessToken,
+		TokenType:   newToken.TokenType,
+		ExpiresIn:   int(time.Until(newToken.Expiry).Seconds()),
+	}
+
+	if newToken.RefreshToken != "" {
+		response.RefreshToken = newToken.RefreshToken
+	}
+
+	return response, nil
+}
+
+// RetryConfig holds configuration for retry behavior
+type RetryConfig struct {
+	MaxRetries      int
+	InitialDelay    time.Duration
+	MaxDelay        time.Duration
+	BackoffFactor   float64
+	RetryableErrors []string
+}
+
+// DefaultRetryConfig returns a default retry configuration
+func DefaultRetryConfig() *RetryConfig {
+	return &RetryConfig{
+		MaxRetries:    3,
+		InitialDelay:  time.Second,
+		MaxDelay:      30 * time.Second,
+		BackoffFactor: 2.0,
+		RetryableErrors: []string{
+			ErrNetwork,
+			ErrTimeout,
+			ErrServerError,
+			ErrRateLimit,
+		},
+	}
+}
+
+// isRetryableError checks if an error is retryable based on configuration
+func (r *RetryConfig) isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for HTTP errors
+	if httpErr, ok := err.(*HTTPError); ok {
+		// Retry on 5xx server errors, 429 rate limit, and some 4xx errors
+		switch httpErr.StatusCode {
+		case http.StatusTooManyRequests, // 429
+			http.StatusInternalServerError, // 500
+			http.StatusBadGateway,          // 502
+			http.StatusServiceUnavailable,  // 503
+			http.StatusGatewayTimeout:      // 504
+			return true
+		case http.StatusRequestTimeout: // 408
+			return true
+		}
+	}
+
+	// Check for context errors (timeout, cancellation)
+	if err == context.DeadlineExceeded || err == context.Canceled {
+		return true
+	}
+
+	// Check error string for retryable error types
+	errStr := err.Error()
+	for _, retryableErr := range r.RetryableErrors {
+		if strings.Contains(errStr, retryableErr) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// calculateBackoffDelay calculates the delay for the next retry using exponential backoff
+func (r *RetryConfig) calculateBackoffDelay(attempt int) time.Duration {
+	if attempt <= 0 {
+		return r.InitialDelay
+	}
+
+	delay := float64(r.InitialDelay) * math.Pow(r.BackoffFactor, float64(attempt))
+	if delay > float64(r.MaxDelay) {
+		delay = float64(r.MaxDelay)
+	}
+
+	// Add some jitter to avoid thundering herd
+	jitter := delay * 0.1 * (0.5 - mathrand.Float64()) // ±10% jitter
+	finalDelay := time.Duration(delay + jitter)
+
+	return finalDelay
+}
+
+// RetryOperation wraps an operation with retry logic using exponential backoff
+func (c *FireflyClient) RetryOperation(ctx context.Context, operation func(ctx context.Context) error) error {
+	retryConfig := DefaultRetryConfig()
+	if c.config != nil {
+		retryConfig.MaxRetries = c.config.RetryCount
+		retryConfig.InitialDelay = c.config.RetryDelay
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= retryConfig.MaxRetries; attempt++ {
+		// Check if context is done before attempting
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// Execute the operation
+		err := operation(ctx)
+		if err == nil {
+			return nil // Success
+		}
+
+		lastErr = err
+
+		// Don't retry on the last attempt
+		if attempt == retryConfig.MaxRetries {
+			break
+		}
+
+		// Check if the error is retryable
+		if !retryConfig.isRetryableError(err) {
+			return err // Not retryable, return immediately
+		}
+
+		// Calculate backoff delay
+		delay := retryConfig.calculateBackoffDelay(attempt)
+
+		// Wait for the delay or context cancellation
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+			// Continue to next attempt
+		}
+	}
+
+	return lastErr
+}
+
+// AddMiddleware adds middleware to the client's middleware chain
+func (c *FireflyClient) AddMiddleware(middleware Middleware) {
+	c.middleware.Add(middleware)
+}
+
+// GetWebhookManager returns the client's webhook manager
+func (c *FireflyClient) GetWebhookManager() *WebhookManager {
+	return c.webhookMgr
+}
+
+// EnableDefaultMiddleware enables commonly used middleware with default configurations
+func (c *FireflyClient) EnableDefaultMiddleware() {
+	// Add rate limiting middleware
+	if c.limiter != nil {
+		c.AddMiddleware(NewRateLimitMiddleware(c.limiter))
+	}
+
+	// Add logging middleware if debug mode is enabled
+	if c.config != nil && c.config.DebugMode {
+		logger := func(format string, args ...interface{}) {
+			fmt.Printf("[DEBUG] "+format+"\n", args...)
+		}
+		c.AddMiddleware(NewLoggingMiddleware(logger))
+	}
+
+	// Add retry middleware if retry is configured
+	if c.config != nil && c.config.RetryCount > 0 {
+		retryConfig := &RetryConfig{
+			MaxRetries:    c.config.RetryCount,
+			InitialDelay:  c.config.RetryDelay,
+			MaxDelay:      30 * time.Second,
+			BackoffFactor: 2.0,
+			RetryableErrors: []string{
+				ErrNetwork,
+				ErrTimeout,
+				ErrServerError,
+				ErrRateLimit,
+			},
+		}
+		c.AddMiddleware(NewRetryMiddleware(retryConfig))
+	}
 }

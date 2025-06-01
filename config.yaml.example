@@ -1,0 +1,31 @@
+# Firefly Client Configuration
+# This is an example configuration file for the Firefly III Go client.
+# You can place this file at:
+#   - ~/.firefly-client/config.yaml
+#   - ./config.yaml (in your current working directory)
+#   - Or specify a custom path with --config flag
+
+# Firefly III instance URL (required)
+# Example: http://localhost:8080 or https://firefly.example.com
+firefly_url: "http://localhost:8080"
+
+# Firefly III API token (required)
+# You can get this from your Firefly III instance:
+# Profile & preferences -> OAuth -> Personal Access Tokens -> Create new token
+token: "your-api-token-here"
+
+# Optional: Output format for commands (json, yaml, table)
+# Default: table
+output_format: "table"
+
+# Optional: Enable debug logging
+# Default: false
+debug: false
+
+# Optional: Request timeout in seconds
+# Default: 30
+timeout: 30
+
+# Optional: API version to use
+# Default: v1
+api_version: "v1"
